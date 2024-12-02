@@ -55,9 +55,10 @@ import (
 )
 
 var (
-	blockInsertTimer = metrics.NewRegisteredTimer("chain/inserts", nil)
-	CheckpointCh     = make(chan int)
-	ErrNoGenesis     = errors.New("Genesis not found in chain")
+	blockInsertTimer        = metrics.NewRegisteredTimer("chain/inserts", nil)
+	CheckpointCh            = make(chan int)
+	ErrNoGenesis            = errors.New("Genesis not found in chain")
+	errInsertionInterrupted = errors.New("insertion is interrupted")
 )
 
 const (
@@ -565,15 +566,17 @@ func (bc *BlockChain) ResetWithGenesisBlock(genesis *types.Block) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
+	batch := bc.db.NewBatch()
+
 	// Prepare the genesis block and reinitialise the chain
-	if err := bc.hc.WriteTd(genesis.Hash(), genesis.NumberU64(), genesis.Difficulty()); err != nil {
-		log.Crit("Failed to write genesis block TD", "err", err)
-	}
-	if err := WriteBlock(bc.db, genesis); err != nil {
+	WriteTd(batch, genesis.Hash(), genesis.NumberU64(), genesis.Difficulty())
+	WriteBlock(batch, genesis)
+	if err := batch.Write(); err != nil {
 		log.Crit("Failed to write genesis block", "err", err)
 	}
+	bc.writeHeadBlock(genesis)
+	// Last update all in-memory chain markers
 	bc.genesisBlock = genesis
-	bc.insert(bc.genesisBlock)
 	bc.currentBlock.Store(bc.genesisBlock)
 	bc.hc.SetGenesis(bc.genesisBlock.Header())
 	bc.hc.SetCurrentHeader(bc.genesisBlock.Header())
@@ -657,24 +660,21 @@ func (bc *BlockChain) ExportN(w io.Writer, first uint64, last uint64) error {
 	return nil
 }
 
-// insert injects a new head block into the current block chain. This method
+// writeHeadBlock injects a new head block into the current block chain. This method
 // assumes that the block is indeed a true head. It will also reset the head
 // header and the head fast sync block to this very same block if they are older
 // or if they are on a different side chain.
 //
 // Note, this function assumes that the `mu` mutex is held!
-func (bc *BlockChain) insert(block *types.Block) {
+func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	// If the block is on a side chain or an unknown one, force other heads onto it too
 	updateHeads := GetCanonicalHash(bc.db, block.NumberU64()) != block.Hash()
 
 	// Add the block to the canonical chain number scheme and mark as the head
-	if err := WriteCanonicalHash(bc.db, block.Hash(), block.NumberU64()); err != nil {
-		log.Crit("Failed to insert block number", "err", err)
-	}
-	if err := WriteHeadBlockHash(bc.db, block.Hash()); err != nil {
-		log.Crit("Failed to insert head block hash", "err", err)
-	}
-	bc.currentBlock.Store(block)
+	batch := bc.db.NewBatch()
+	WriteCanonicalHash(batch, block.Hash(), block.NumberU64())
+	WriteTxLookupEntries(batch, block)
+	WriteHeadBlockHash(batch, block.Hash())
 
 	// save cache BlockSigners
 	if bc.chainConfig.Posv != nil && !bc.chainConfig.IsTIPSigning(block.Number()) {
@@ -686,13 +686,19 @@ func (bc *BlockChain) insert(block *types.Block) {
 
 	// If the block is better than our head or is on a different chain, force update heads
 	if updateHeads {
+		WriteHeadBlockHash(batch, block.Hash())
+		WriteHeadFastBlockHash(batch, block.Hash())
+	}
+	// Flush the whole batch into the disk, exit the node if failed
+	if err := batch.Write(); err != nil {
+		log.Crit("Failed to update chain indexes and markers", "err", err)
+	}
+	// Update all in-memory chain markers in the last step
+	if updateHeads {
 		bc.hc.SetCurrentHeader(block.Header())
-
-		if err := WriteHeadFastBlockHash(bc.db, block.Hash()); err != nil {
-			log.Crit("Failed to insert head fast block hash", "err", err)
-		}
 		bc.currentFastBlock.Store(block)
 	}
+	bc.currentBlock.Store(block)
 }
 
 // Genesis retrieves the chain's genesis block.
@@ -1012,6 +1018,43 @@ func (bc *BlockChain) Rollback(chain []common.Hash) {
 		}
 	}
 }
+
+// // Rollback is designed to remove a chain of links from the database that aren't
+// // certain enough to be valid.
+// func (bc *BlockChain) Rollback(chain []common.Hash) {
+// 	bc.mu.Lock()
+// 	defer bc.mu.Unlock()
+
+// 	batch := bc.db.NewBatch()
+// 	for i := len(chain) - 1; i >= 0; i-- {
+// 		hash := chain[i]
+
+// 		// Degrade the chain markers if they are explicitly reverted.
+// 		// In theory we should update all in-memory markers in the
+// 		// last step, however the direction of rollback is from high
+// 		// to low, so it's safe the update in-memory markers directly.
+// 		currentHeader := bc.hc.CurrentHeader()
+// 		if currentHeader.Hash() == hash {
+// 			newHeadHeader := bc.GetHeader(currentHeader.ParentHash, currentHeader.Number.Uint64()-1)
+// 			WriteHeadHeaderHash(batch, currentHeader.ParentHash)
+// 			bc.hc.SetCurrentHeader(newHeadHeader)
+// 		}
+// 		if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock.Hash() == hash {
+// 			newFastBlock := bc.GetBlock(currentFastBlock.ParentHash(), currentFastBlock.NumberU64()-1)
+// 			WriteHeadFastBlockHash(batch, currentFastBlock.ParentHash())
+// 			bc.currentFastBlock.Store(newFastBlock)
+// 		}
+// 		if currentBlock := bc.CurrentBlock(); currentBlock.Hash() == hash {
+// 			newBlock := bc.GetBlock(currentBlock.ParentHash(), currentBlock.NumberU64()-1)
+// 			WriteHeadBlockHash(batch, currentBlock.ParentHash())
+// 			bc.currentBlock.Store(newBlock)
+// 		}
+
+// 		if err := batch.Write(); err != nil {
+// 			log.Crit("Failed to rollback chain markers", "err", err)
+// 		}
+// 	}
+// }
 
 // SetReceiptsData computes all the non-consensus fields of the receipts
 func SetReceiptsData(config *params.ChainConfig, block *types.Block, receipts types.Receipts) error {
@@ -1368,7 +1411,7 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 
 	// Set new head.
 	if status == CanonStatTy {
-		bc.insert(block)
+		bc.writeHeadBlock(block)
 	}
 	// save cache BlockSigners
 	if bc.chainConfig.Posv != nil && bc.chainConfig.IsTIPSigning(block.Number()) {
@@ -2198,7 +2241,7 @@ func (bc *BlockChain) reorg(oldBlock, newBlock *types.Block) error {
 	var addedTxs types.Transactions
 	for i := len(newChain) - 1; i >= 0; i-- {
 		// insert the block in the canonical way, re-writing history
-		bc.insert(newChain[i])
+		bc.writeHeadBlock(newChain[i])
 		// write lookup entries for hash based transaction/receipt searches
 		if err := WriteTxLookupEntries(bc.db, newChain[i]); err != nil {
 			return err
