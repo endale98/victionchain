@@ -18,11 +18,12 @@ package core
 
 import (
 	"crypto/ecdsa"
-	"github.com/tomochain/tomochain/core/rawdb"
 	"io/ioutil"
 	"math/big"
 	"os"
 	"testing"
+
+	"github.com/tomochain/tomochain/core/rawdb"
 
 	"github.com/tomochain/tomochain/common"
 	"github.com/tomochain/tomochain/common/math"
@@ -222,31 +223,37 @@ func BenchmarkChainWrite_full_500k(b *testing.B) {
 
 // makeChainForBench writes a given number of headers or empty blocks/receipts
 // into a database.
-func makeChainForBench(db ethdb.Database, full bool, count uint64) {
+func makeChainForBench(db ethdb.Database, genesis *Genesis, full bool, count uint64) {
 	var hash common.Hash
 	for n := uint64(0); n < count; n++ {
-		header := &types.Header{
-			Coinbase:    common.Address{},
-			Number:      big.NewInt(int64(n)),
-			ParentHash:  hash,
-			Difficulty:  big.NewInt(1),
-			UncleHash:   types.EmptyUncleHash,
-			TxHash:      types.EmptyRootHash,
-			ReceiptHash: types.EmptyRootHash,
-		}
-		hash = header.Hash()
-		WriteHeader(db, header)
-		WriteCanonicalHash(db, hash, n)
-		WriteTd(db, hash, n, big.NewInt(int64(n+1)))
-		if full || n == 0 {
-			block := types.NewBlockWithHeader(header)
-			WriteBody(db, hash, n, block.Body())
-			WriteBlockReceipts(db, hash, n, nil)
+		if n == 0 {
+			genesis.MustCommit(db)
+		} else {
+			header := &types.Header{
+				Coinbase:    common.Address{},
+				Number:      big.NewInt(int64(n)),
+				ParentHash:  hash,
+				Difficulty:  big.NewInt(1),
+				UncleHash:   types.EmptyUncleHash,
+				TxHash:      types.EmptyRootHash,
+				ReceiptHash: types.EmptyRootHash,
+			}
+			hash = header.Hash()
+			WriteHeader(db, header)
+			WriteCanonicalHash(db, hash, n)
+			WriteTd(db, hash, n, big.NewInt(int64(n+1)))
+
+			if full {
+				block := types.NewBlockWithHeader(header)
+				WriteBody(db, hash, n, block.Body())
+				WriteBlockReceipts(db, hash, n, nil)
+			}
 		}
 	}
 }
 
 func benchWriteChain(b *testing.B, full bool, count uint64) {
+	genesis := &Genesis{Config: params.VicMainnetChainConfig}
 	for i := 0; i < b.N; i++ {
 		dir, err := ioutil.TempDir("", "eth-chain-bench")
 		if err != nil {
@@ -256,7 +263,7 @@ func benchWriteChain(b *testing.B, full bool, count uint64) {
 		if err != nil {
 			b.Fatalf("error opening database at %v: %v", dir, err)
 		}
-		makeChainForBench(db, full, count)
+		makeChainForBench(db, genesis, full, count)
 		db.Close()
 		os.RemoveAll(dir)
 	}
@@ -273,7 +280,9 @@ func benchReadChain(b *testing.B, full bool, count uint64) {
 	if err != nil {
 		b.Fatalf("error opening database at %v: %v", dir, err)
 	}
-	makeChainForBench(db, full, count)
+	genesis := &Genesis{Config: params.VicMainnetChainConfig}
+
+	makeChainForBench(db, genesis, full, count)
 	db.Close()
 
 	b.ReportAllocs()
