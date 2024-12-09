@@ -18,11 +18,13 @@ package core
 
 import (
 	"crypto/ecdsa"
-	"github.com/tomochain/tomochain/core/rawdb"
 	"io/ioutil"
 	"math/big"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/tomochain/tomochain/core/rawdb"
 
 	"github.com/tomochain/tomochain/common"
 	"github.com/tomochain/tomochain/common/math"
@@ -75,7 +77,7 @@ var (
 	// This is the content of the genesis block used by the benchmarks.
 	benchRootKey, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 	benchRootAddr   = crypto.PubkeyToAddress(benchRootKey.PublicKey)
-	benchRootFunds  = math.BigPow(2, 100)
+	benchRootFunds  = math.BigPow(2, 200)
 )
 
 // genValueTx returns a block generator that includes a single
@@ -184,7 +186,7 @@ func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen)) {
 }
 
 func BenchmarkChainRead_header_10k(b *testing.B) {
-	benchReadChain(b, false, 10000)
+	benchReadChain(b, false, 100)
 }
 func BenchmarkChainRead_full_10k(b *testing.B) {
 	benchReadChain(b, true, 10000)
@@ -222,7 +224,7 @@ func BenchmarkChainWrite_full_500k(b *testing.B) {
 
 // makeChainForBench writes a given number of headers or empty blocks/receipts
 // into a database.
-func makeChainForBench(db ethdb.Database, full bool, count uint64) {
+func makeChainForBench(db ethdb.Database, genesis *Genesis, full bool, count uint64) {
 	var hash common.Hash
 	for n := uint64(0); n < count; n++ {
 		header := &types.Header{
@@ -234,19 +236,32 @@ func makeChainForBench(db ethdb.Database, full bool, count uint64) {
 			TxHash:      types.EmptyRootHash,
 			ReceiptHash: types.EmptyRootHash,
 		}
+		if n == 0 {
+			header = genesis.ToBlock(db).Header()
+		}
+
 		hash = header.Hash()
+
 		WriteHeader(db, header)
 		WriteCanonicalHash(db, hash, n)
 		WriteTd(db, hash, n, big.NewInt(int64(n+1)))
+
+		if n == 0 {
+			WriteChainConfig(db, hash, genesis.Config)
+		}
+
+		WriteHeadHeaderHash(db, hash)
 		if full || n == 0 {
 			block := types.NewBlockWithHeader(header)
 			WriteBody(db, hash, n, block.Body())
 			WriteBlockReceipts(db, hash, n, nil)
+			WriteHeadBlockHash(db, hash)
 		}
 	}
 }
 
 func benchWriteChain(b *testing.B, full bool, count uint64) {
+	genesis := &Genesis{Config: params.TestChainConfig}
 	for i := 0; i < b.N; i++ {
 		dir, err := ioutil.TempDir("", "eth-chain-bench")
 		if err != nil {
@@ -256,7 +271,7 @@ func benchWriteChain(b *testing.B, full bool, count uint64) {
 		if err != nil {
 			b.Fatalf("error opening database at %v: %v", dir, err)
 		}
-		makeChainForBench(db, full, count)
+		makeChainForBench(db, genesis, full, count)
 		db.Close()
 		os.RemoveAll(dir)
 	}
@@ -273,8 +288,18 @@ func benchReadChain(b *testing.B, full bool, count uint64) {
 	if err != nil {
 		b.Fatalf("error opening database at %v: %v", dir, err)
 	}
-	makeChainForBench(db, full, count)
+
+	genesis := &Genesis{Config: params.TestChainConfig}
+
+	makeChainForBench(db, genesis, full, count)
 	db.Close()
+
+	cacheConfig := &CacheConfig{
+		TrieNodeLimit: 256 * 1024 * 1024,
+		TrieTimeLimit: 5 * time.Minute,
+	}
+
+	cacheConfig.Disabled = true
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -284,7 +309,7 @@ func benchReadChain(b *testing.B, full bool, count uint64) {
 		if err != nil {
 			b.Fatalf("error opening database at %v: %v", dir, err)
 		}
-		chain, err := NewBlockChain(db, nil, params.TestChainConfig, ethash.NewFaker(), vm.Config{})
+		chain, err := NewBlockChain(db, cacheConfig, genesis.Config, ethash.NewFaker(), vm.Config{})
 		if err != nil {
 			b.Fatalf("error creating chain: %v", err)
 		}
