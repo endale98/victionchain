@@ -75,6 +75,13 @@ func (b *BlockGen) SetExtra(data []byte) {
 	b.header.Extra = data
 }
 
+// SetDifficulty sets the difficulty field of the generated block. This method is
+// useful for Clique tests where the difficulty does not depend on time. For the
+// ethash tests, please use OffsetTime, which implicitly recalculates the diff.
+func (b *BlockGen) SetDifficulty(diff *big.Int) {
+	b.header.Difficulty = diff
+}
+
 // AddTx adds a transaction to the generated block. If no coinbase has
 // been set, the block's coinbase is set to the zero address.
 //
@@ -165,7 +172,8 @@ func (b *BlockGen) OffsetTime(seconds int64) {
 	if b.header.Time.Cmp(b.parent.Header().Time) <= 0 {
 		panic("block time out of range")
 	}
-	b.header.Difficulty = b.engine.CalcDifficulty(b.chainReader, b.header.Time.Uint64(), b.parent.Header())
+	chainreader := &fakeChainReader{config: b.config}
+	b.header.Difficulty = b.engine.CalcDifficulty(chainreader, b.header.Time.Uint64(), b.parent.Header())
 }
 
 // GenerateChain creates a chain of n blocks. The first block's
@@ -185,14 +193,15 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 		config = params.TestChainConfig
 	}
 	blocks, receipts := make(types.Blocks, n), make([]types.Receipts, n)
+	chainreader := &fakeChainReader{config: config}
 	genblock := func(i int, parent *types.Block, statedb *state.StateDB) (*types.Block, types.Receipts) {
 		// TODO(karalabe): This is needed for posv, which depends on multiple blocks.
 		// It's nonetheless ugly to spin up a blockchain here. Get rid of this somehow.
-		blockchain, _ := NewBlockChain(db, nil, config, engine, vm.Config{})
-		defer blockchain.Stop()
+		// blockchain, _ := NewBlockChain(db, nil, config, engine, vm.Config{})
+		// defer blockchain.Stop()
 
-		b := &BlockGen{i: i, parent: parent, chain: blocks, chainReader: blockchain, statedb: statedb, config: config, engine: engine}
-		b.header = makeHeader(b.chainReader, parent, statedb, b.engine)
+		b := &BlockGen{i: i, parent: parent, chain: blocks, statedb: statedb, config: config, engine: engine}
+		b.header = makeHeader(chainreader, parent, statedb, b.engine)
 
 		// Mutate the state and block according to any hard-fork specs
 		if daoBlock := config.DAOForkBlock; daoBlock != nil {
@@ -215,7 +224,7 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 		}
 
 		if b.engine != nil {
-			block, _ := b.engine.Finalize(b.chainReader, b.header, statedb, statedb.Copy(), b.txs, b.uncles, b.receipts)
+			block, _ := b.engine.Finalize(chainreader, b.header, statedb, statedb.Copy(), b.txs, b.uncles, b.receipts)
 			// Write state changes to db
 			root, err := statedb.Commit(config.IsEIP158(b.header.Number))
 			if err != nil {
@@ -321,3 +330,19 @@ func makeBlockChain(parent *types.Block, n int, engine consensus.Engine, db ethd
 	})
 	return blocks
 }
+
+type fakeChainReader struct {
+	config  *params.ChainConfig
+	genesis *types.Block
+}
+
+// Config returns the chain configuration.
+func (cr *fakeChainReader) Config() *params.ChainConfig {
+	return cr.config
+}
+
+func (cr *fakeChainReader) CurrentHeader() *types.Header                            { return nil }
+func (cr *fakeChainReader) GetHeaderByNumber(number uint64) *types.Header           { return nil }
+func (cr *fakeChainReader) GetHeaderByHash(hash common.Hash) *types.Header          { return nil }
+func (cr *fakeChainReader) GetHeader(hash common.Hash, number uint64) *types.Header { return nil }
+func (cr *fakeChainReader) GetBlock(hash common.Hash, number uint64) *types.Block   { return nil }

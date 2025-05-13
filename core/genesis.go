@@ -270,6 +270,7 @@ func (g *Genesis) ToBlock(db ethdb.Database) *types.Block {
 // The block is committed as the canonical head block.
 func (g *Genesis) Commit(db ethdb.Database) (*types.Block, error) {
 	block := g.ToBlock(db)
+	fmt.Println("Detect CurrentBlock", block)
 	if block.Number().Sign() != 0 {
 		return nil, fmt.Errorf("can't commit genesis block with number > 0")
 	}

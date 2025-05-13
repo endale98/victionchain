@@ -18,11 +18,12 @@ package core
 
 import (
 	"crypto/ecdsa"
-	"github.com/tomochain/tomochain/core/rawdb"
 	"io/ioutil"
 	"math/big"
 	"os"
 	"testing"
+
+	"github.com/tomochain/tomochain/core/rawdb"
 
 	"github.com/tomochain/tomochain/common"
 	"github.com/tomochain/tomochain/common/math"
@@ -242,6 +243,7 @@ func makeChainForBench(db ethdb.Database, full bool, count uint64) {
 			block := types.NewBlockWithHeader(header)
 			WriteBody(db, hash, n, block.Body())
 			WriteBlockReceipts(db, hash, n, nil)
+			WriteHeadBlockHash(db, hash)
 		}
 	}
 }
@@ -279,12 +281,16 @@ func benchReadChain(b *testing.B, full bool, count uint64) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
+	cacheConfig := &CacheConfig{
+		Disabled: true,
+	}
+
 	for i := 0; i < b.N; i++ {
 		db, err := rawdb.NewLevelDBDatabase(dir, 128, 1024, "")
 		if err != nil {
 			b.Fatalf("error opening database at %v: %v", dir, err)
 		}
-		chain, err := NewBlockChain(db, nil, params.TestChainConfig, ethash.NewFaker(), vm.Config{})
+		chain, err := NewBlockChain(db, cacheConfig, params.TestChainConfig, ethash.NewFaker(), vm.Config{})
 		if err != nil {
 			b.Fatalf("error creating chain: %v", err)
 		}

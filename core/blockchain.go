@@ -124,7 +124,7 @@ type BlockChain struct {
 	scope         event.SubscriptionScope
 	genesisBlock  *types.Block
 
-	mu      sync.RWMutex // global mutex for locking chain operations
+	// mu      sync.RWMutex // global mutex for locking chain operations
 	chainmu sync.RWMutex // blockchain insertion lock
 	procmu  sync.RWMutex // block processor lock
 
@@ -231,6 +231,11 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	if bc.genesisBlock == nil {
 		return nil, ErrNoGenesis
 	}
+
+	var nilBlock *types.Block
+	bc.currentBlock.Store(nilBlock)
+	bc.currentFastBlock.Store(nilBlock)
+
 	if err := bc.loadLastState(); err != nil {
 		return nil, err
 	}
@@ -380,15 +385,60 @@ func (bc *BlockChain) loadLastState() error {
 func (bc *BlockChain) SetHead(head uint64) error {
 	log.Warn("Rewinding blockchain", "target", head)
 
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	bc.chainmu.Lock()
+	defer bc.chainmu.Unlock()
+
+	// Update fn
+	updateFn := func(db ethdb.KeyValueWriter, header *types.Header) {
+		// Rewind the block chain, ensuring we don't end up with a stateless head block
+		if currentBlock := bc.CurrentBlock(); currentBlock != nil && header.Number.Uint64() < currentBlock.NumberU64() {
+			newHeadBlock := bc.GetBlock(header.Hash(), header.Number.Uint64())
+			fmt.Println("New HeadBLock set", newHeadBlock)
+			if newHeadBlock == nil {
+				newHeadBlock = bc.genesisBlock
+			} else {
+				if _, err := state.New(newHeadBlock.Root(), bc.stateCache); err != nil {
+					// Rewound state missing, rolled back to before pivot, reset to genesis
+					newHeadBlock = bc.genesisBlock
+				}
+			}
+			// store head block's hash
+			WriteHeadBlockHash(db, newHeadBlock.Hash())
+
+			// Degrade the chain markers if they are explicitly reverted.
+			// In theory we should update all in-memory markers in the
+			// last step, however the direction of SetHead is from high
+			// to low, so it's safe the update in-memory markers directly.
+			bc.currentBlock.Store(newHeadBlock)
+		}
+
+		// Rewind the fast block in a simpleton way to the target head
+		if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock != nil && header.Number.Uint64() < currentFastBlock.NumberU64() {
+			newHeadFastBlock := bc.GetBlock(header.Hash(), header.Number.Uint64())
+			// If either blocks reached nil, reset to the genesis state
+			if newHeadFastBlock == nil {
+				newHeadFastBlock = bc.genesisBlock
+			}
+
+			WriteHeadFastBlockHash(db, newHeadFastBlock.Hash())
+
+			// Degrade the chain markers if they are explicitly reverted.
+			// In theory we should update all in-memory markers in the
+			// last step, however the direction of SetHead is from high
+			// to low, so it's safe the update in-memory markers directly.
+			bc.currentFastBlock.Store(newHeadFastBlock)
+		}
+	}
 
 	// Rewind the header chain, deleting all block bodies until then
-	delFn := func(hash common.Hash, num uint64) {
-		DeleteBody(bc.db, hash, num)
+	delFn := func(db ethdb.KeyValueWriter, hash common.Hash, num uint64) {
+		// Remove relative body from the active store.
+		// The header, total difficulty and canonical hash will be
+		// removed in the hc.SetHead function.
+		DeleteBody(db, hash, num)
 	}
-	bc.hc.SetHead(head, delFn)
-	currentHeader := bc.hc.CurrentHeader()
+
+	bc.hc.SetHead(head, updateFn, delFn)
 
 	// Clear out any stale content from the caches
 	bc.bodyCache.Purge()
@@ -397,35 +447,6 @@ func (bc *BlockChain) SetHead(head uint64) error {
 	bc.futureBlocks.Purge()
 	bc.blocksHashCache.Purge()
 
-	// Rewind the block chain, ensuring we don't end up with a stateless head block
-	if currentBlock := bc.CurrentBlock(); currentBlock != nil && currentHeader.Number.Uint64() < currentBlock.NumberU64() {
-		bc.currentBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64()))
-	}
-	if currentBlock := bc.CurrentBlock(); currentBlock != nil {
-		if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil {
-			// Rewound state missing, rolled back to before pivot, reset to genesis
-			bc.currentBlock.Store(bc.genesisBlock)
-		}
-	}
-	// Rewind the fast block in a simpleton way to the target head
-	if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock != nil && currentHeader.Number.Uint64() < currentFastBlock.NumberU64() {
-		bc.currentFastBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64()))
-	}
-	// If either blocks reached nil, reset to the genesis state
-	if currentBlock := bc.CurrentBlock(); currentBlock == nil {
-		bc.currentBlock.Store(bc.genesisBlock)
-	}
-	if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock == nil {
-		bc.currentFastBlock.Store(bc.genesisBlock)
-	}
-	currentBlock := bc.CurrentBlock()
-	currentFastBlock := bc.CurrentFastBlock()
-	if err := WriteHeadBlockHash(bc.db, currentBlock.Hash()); err != nil {
-		log.Crit("Failed to reset head full block", "err", err)
-	}
-	if err := WriteHeadFastBlockHash(bc.db, currentFastBlock.Hash()); err != nil {
-		log.Crit("Failed to reset head fast block", "err", err)
-	}
 	return bc.loadLastState()
 }
 
@@ -441,9 +462,9 @@ func (bc *BlockChain) FastSyncCommitHead(hash common.Hash) error {
 		return err
 	}
 	// If all checks out, manually set the head block
-	bc.mu.Lock()
+	bc.chainmu.Lock()
 	bc.currentBlock.Store(block)
-	bc.mu.Unlock()
+	bc.chainmu.Unlock()
 
 	log.Info("Committed new head block", "number", block.Number(), "hash", hash)
 	return nil
@@ -562,18 +583,22 @@ func (bc *BlockChain) ResetWithGenesisBlock(genesis *types.Block) error {
 	if err := bc.SetHead(0); err != nil {
 		return err
 	}
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	bc.chainmu.Lock()
+	defer bc.chainmu.Unlock()
 
 	// Prepare the genesis block and reinitialise the chain
-	if err := bc.hc.WriteTd(genesis.Hash(), genesis.NumberU64(), genesis.Difficulty()); err != nil {
-		log.Crit("Failed to write genesis block TD", "err", err)
-	}
-	if err := WriteBlock(bc.db, genesis); err != nil {
+	batch := bc.db.NewBatch()
+	WriteTd(batch, genesis.Hash(), genesis.NumberU64(), genesis.Difficulty())
+	WriteBlock(batch, genesis)
+
+	if err := batch.Write(); err != nil {
 		log.Crit("Failed to write genesis block", "err", err)
 	}
+
+	bc.insert(genesis)
+
+	// Last update all in-memory chain markers
 	bc.genesisBlock = genesis
-	bc.insert(bc.genesisBlock)
 	bc.currentBlock.Store(bc.genesisBlock)
 	bc.hc.SetGenesis(bc.genesisBlock.Header())
 	bc.hc.SetCurrentHeader(bc.genesisBlock.Header())
@@ -635,8 +660,8 @@ func (bc *BlockChain) Export(w io.Writer) error {
 
 // ExportN writes a subset of the active chain to the given writer.
 func (bc *BlockChain) ExportN(w io.Writer, first uint64, last uint64) error {
-	bc.mu.RLock()
-	defer bc.mu.RUnlock()
+	bc.chainmu.RLock()
+	defer bc.chainmu.RUnlock()
 
 	if first > last {
 		return fmt.Errorf("export failed: first (%d) is greater than last (%d)", first, last)
@@ -668,12 +693,27 @@ func (bc *BlockChain) insert(block *types.Block) {
 	updateHeads := GetCanonicalHash(bc.db, block.NumberU64()) != block.Hash()
 
 	// Add the block to the canonical chain number scheme and mark as the head
-	if err := WriteCanonicalHash(bc.db, block.Hash(), block.NumberU64()); err != nil {
-		log.Crit("Failed to insert block number", "err", err)
+	batch := bc.db.NewBatch()
+	WriteCanonicalHash(batch, block.Hash(), block.NumberU64())
+	WriteHeadBlockHash(batch, block.Hash())
+
+	// If the block is better than our head or is on a different chain, force update heads
+	if updateHeads {
+		WriteHeadHeaderHash(batch, block.Hash())
+		WriteHeadFastBlockHash(batch, block.Hash())
 	}
-	if err := WriteHeadBlockHash(bc.db, block.Hash()); err != nil {
-		log.Crit("Failed to insert head block hash", "err", err)
+
+	// Flush the whole batch into the disk, exit the node if failed
+	if err := batch.Write(); err != nil {
+		log.Crit("Failed to update chain indexes and markers", "err", err)
 	}
+
+	// Update all in-memory chain markers in the last step
+	if updateHeads {
+		bc.hc.SetCurrentHeader(block.Header())
+		bc.currentFastBlock.Store(block)
+	}
+
 	bc.currentBlock.Store(block)
 
 	// save cache BlockSigners
@@ -682,16 +722,6 @@ func (bc *BlockChain) insert(block *types.Block) {
 		if ok {
 			engine.CacheData(block.Header(), block.Transactions(), bc.GetReceiptsByHash(block.Hash()))
 		}
-	}
-
-	// If the block is better than our head or is on a different chain, force update heads
-	if updateHeads {
-		bc.hc.SetCurrentHeader(block.Header())
-
-		if err := WriteHeadFastBlockHash(bc.db, block.Hash()); err != nil {
-			log.Crit("Failed to insert head fast block hash", "err", err)
-		}
-		bc.currentFastBlock.Store(block)
 	}
 }
 
@@ -872,8 +902,8 @@ func (bc *BlockChain) SaveData() {
 	bc.wg.Add(1)
 	defer bc.wg.Done()
 	// Make sure no inconsistent state is leaked during insertion
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	bc.chainmu.Lock()
+	defer bc.chainmu.Unlock()
 	// Ensure the state of a recent block is also stored to disk before exiting.
 	// We're writing three different states to catch different restart scenarios:
 	//  - HEAD:     So we don't need to reprocess any blocks in the general case
@@ -990,8 +1020,8 @@ const (
 // Rollback is designed to remove a chain of links from the database that aren't
 // certain enough to be valid.
 func (bc *BlockChain) Rollback(chain []common.Hash) {
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	bc.chainmu.Lock()
+	defer bc.chainmu.Unlock()
 
 	for i := len(chain) - 1; i >= 0; i-- {
 		hash := chain[i]
@@ -1102,8 +1132,9 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 		if err := WriteTxLookupEntries(batch, block); err != nil {
 			return i, fmt.Errorf("failed to write lookup metadata: %v", err)
 		}
-		stats.processed++
-
+		// Write everything belongs to the blocks into the database. So that
+		// we can ensure all components of body is completed(body, receipts,
+		// tx indexes)
 		if batch.ValueSize() >= ethdb.IdealBatchSize {
 			if err := batch.Write(); err != nil {
 				return 0, err
@@ -1111,7 +1142,11 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			bytes += batch.ValueSize()
 			batch.Reset()
 		}
+		stats.processed++
 	}
+	// Write everything belongs to the blocks into the database. So that
+	// we can ensure all components of body is completed(body, receipts,
+	// tx indexes)
 	if batch.ValueSize() > 0 {
 		bytes += batch.ValueSize()
 		if err := batch.Write(); err != nil {
@@ -1120,7 +1155,7 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 	}
 
 	// Update the head fast sync block if better
-	bc.mu.Lock()
+	bc.chainmu.Lock()
 	head := blockChain[len(blockChain)-1]
 	if td := bc.GetTd(head.Hash(), head.NumberU64()); td != nil { // Rewind may have occurred, skip in that case
 		currentFastBlock := bc.CurrentFastBlock()
@@ -1131,7 +1166,7 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			bc.currentFastBlock.Store(head)
 		}
 	}
-	bc.mu.Unlock()
+	bc.chainmu.Unlock()
 
 	log.Info("Imported new block receipts",
 		"count", stats.processed,
@@ -1152,17 +1187,26 @@ func (bc *BlockChain) WriteBlockWithoutState(block *types.Block, td *big.Int) (e
 	bc.wg.Add(1)
 	defer bc.wg.Done()
 
-	if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), td); err != nil {
-		return err
-	}
-	if err := WriteBlock(bc.db, block); err != nil {
-		return err
+	batch := bc.db.NewBatch()
+	WriteTd(batch, block.Hash(), block.NumberU64(), td)
+	WriteBlock(batch, block)
+	if err := batch.Write(); err != nil {
+		log.Crit("Failed to write block into disk", "err", err)
 	}
 	return nil
 }
 
 // WriteBlockWithState writes the block and all associated state to the database.
 func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB, tradingState *tradingstate.TradingStateDB, lendingState *lendingstate.LendingStateDB) (status WriteStatus, err error) {
+	bc.chainmu.Lock()
+	defer bc.chainmu.Unlock()
+
+	return bc.writeBlockWithState(block, receipts, state, tradingState, lendingState)
+}
+
+// writeBlockWithState writes the block and all associated state to the database,
+// but is expects the chain mutex to be held.
+func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB, tradingState *tradingstate.TradingStateDB, lendingState *lendingstate.LendingStateDB) (status WriteStatus, err error) {
 	bc.wg.Add(1)
 	defer bc.wg.Done()
 
@@ -1172,22 +1216,36 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 		return NonStatTy, consensus.ErrUnknownAncestor
 	}
 	// Make sure no inconsistent state is leaked during insertion
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
+	// bc.chainmu.Lock()
+	// defer bc.chainmu.Unlock()
 
 	currentBlock := bc.CurrentBlock()
 	localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
 	externTd := new(big.Int).Add(block.Difficulty(), ptd)
 
-	// Irrelevant of the canonical status, write the block itself to the database
-	if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), externTd); err != nil {
-		return NonStatTy, err
+	// // Irrelevant of the canonical status, write the block itself to the database
+	// if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), externTd); err != nil {
+	// 	return NonStatTy, err
+	// }
+
+	// Irrelevant of the canonical status, write the block itself to the database.
+	//
+	// Note all the components of block(td, hash->number map, header, body, receipts)
+	// should be written atomically. BlockBatch is used for containing all components.
+	blockBatch := bc.db.NewBatch()
+	WriteTd(blockBatch, block.Hash(), block.NumberU64(), externTd)
+	WriteBlock(blockBatch, block)
+	WriteBlockReceipts(blockBatch, block.Hash(), block.NumberU64(), receipts)
+	if err := blockBatch.Write(); err != nil {
+		log.Crit("Failed to write block into disk", "err", err)
 	}
-	// Write other block data using a batch.
-	batch := bc.db.NewBatch()
-	if err := WriteBlock(batch, block); err != nil {
-		return NonStatTy, err
-	}
+
+	// // Write other block data using a batch.
+	// batch := bc.db.NewBatch()
+	// if err := WriteBlock(batch, block); err != nil {
+	// 	return NonStatTy, err
+	// }
+
 	root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number()))
 	if err != nil {
 		return NonStatTy, err
@@ -1331,9 +1389,9 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 			}
 		}
 	}
-	if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil {
-		return NonStatTy, err
-	}
+	// if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil {
+	// 	return NonStatTy, err
+	// }
 	// If the total difficulty is higher than our known, add it to the canonical chain
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
@@ -1351,9 +1409,9 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 			}
 		}
 		// Write the positional metadata for transaction and receipt lookups
-		if err := WriteTxLookupEntries(batch, block); err != nil {
-			return NonStatTy, err
-		}
+		// if err := WriteTxLookupEntries(batch, block); err != nil {
+		// 	return NonStatTy, err
+		// }
 		// Write hash preimages
 		if err := WritePreimages(bc.db, block.NumberU64(), state.Preimages()); err != nil {
 			return NonStatTy, err
@@ -1362,9 +1420,9 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	} else {
 		status = SideStatTy
 	}
-	if err := batch.Write(); err != nil {
-		return NonStatTy, err
-	}
+	// if err := batch.Write(); err != nil {
+	// 	return NonStatTy, err
+	// }
 
 	// Set new head.
 	if status == CanonStatTy {
@@ -1647,7 +1705,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		}
 		proctime := time.Since(bstart)
 		// Write the block to the chain and get the status.
-		status, err := bc.WriteBlockWithState(block, receipts, statedb, tradingState, lendingState)
+		status, err := bc.writeBlockWithState(block, receipts, statedb, tradingState, lendingState)
 		if err != nil {
 			return i, events, coalescedLogs, err
 		}
@@ -2329,9 +2387,6 @@ func (bc *BlockChain) InsertHeaderChain(chain []*types.Header, checkFreq int) (i
 	defer bc.wg.Done()
 
 	whFunc := func(header *types.Header) error {
-		bc.mu.Lock()
-		defer bc.mu.Unlock()
-
 		_, err := bc.hc.WriteHeader(header)
 		return err
 	}
@@ -2348,16 +2403,16 @@ func (bc *BlockChain) InsertHeaderChain(chain []*types.Header, checkFreq int) (i
 // without the real blocks. Hence, writing headers directly should only be done
 // in two scenarios: pure-header mode of operation (light clients), or properly
 // separated header/block phases (non-archive clients).
-func (bc *BlockChain) writeHeader(header *types.Header) error {
-	bc.wg.Add(1)
-	defer bc.wg.Done()
+// func (bc *BlockChain) writeHeader(header *types.Header) error {
+// 	bc.wg.Add(1)
+// 	defer bc.wg.Done()
 
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
+// 	bc.mu.Lock()
+// 	defer bc.mu.Unlock()
 
-	_, err := bc.hc.WriteHeader(header)
-	return err
-}
+// 	_, err := bc.hc.WriteHeader(header)
+// 	return err
+// }
 
 // CurrentHeader retrieves the current head header of the canonical chain. The
 // header is retrieved from the HeaderChain's internal cache.

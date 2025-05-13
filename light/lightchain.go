@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/tomochain/tomochain/common"
 	"github.com/tomochain/tomochain/consensus"
 	"github.com/tomochain/tomochain/core"
@@ -165,7 +165,7 @@ func (bc *LightChain) SetHead(head uint64) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
-	bc.hc.SetHead(head, nil)
+	bc.hc.SetHead(head, nil, nil)
 	bc.loadLastState()
 }
 
@@ -188,13 +188,23 @@ func (bc *LightChain) ResetWithGenesisBlock(genesis *types.Block) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
-	// Prepare the genesis block and reinitialise the chain
-	if err := core.WriteTd(bc.chainDb, genesis.Hash(), genesis.NumberU64(), genesis.Difficulty()); err != nil {
-		log.Crit("Failed to write genesis block TD", "err", err)
+	// // Prepare the genesis block and reinitialise the chain
+	// if err := core.WriteTd(bc.chainDb, genesis.Hash(), genesis.NumberU64(), genesis.Difficulty()); err != nil {
+	// 	log.Crit("Failed to write genesis block TD", "err", err)
+	// }
+	// if err := core.WriteBlock(bc.chainDb, genesis); err != nil {
+	// 	log.Crit("Failed to write genesis block", "err", err)
+	// }
+
+	batch := bc.chainDb.NewBatch()
+	core.WriteTd(batch, genesis.Hash(), genesis.NumberU64(), genesis.Difficulty())
+	core.WriteBlock(batch, genesis)
+	core.WriteHeadHeaderHash(batch, genesis.Hash())
+
+	if err := batch.Write(); err != nil {
+		log.Crit("Failed to reset genesis block", "err", err)
 	}
-	if err := core.WriteBlock(bc.chainDb, genesis); err != nil {
-		log.Crit("Failed to write genesis block", "err", err)
-	}
+
 	bc.genesisBlock = genesis
 	bc.hc.SetGenesis(bc.genesisBlock.Header())
 	bc.hc.SetCurrentHeader(bc.genesisBlock.Header())
@@ -309,12 +319,25 @@ func (self *LightChain) Rollback(chain []common.Hash) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
+	batch := self.chainDb.NewBatch()
+
 	for i := len(chain) - 1; i >= 0; i-- {
+
 		hash := chain[i]
 
+		// Degrade the chain markers if they are explicitly reverted.
+		// In theory we should update all in-memory markers in the
+		// last step, however the direction of rollback is from high
+		// to low, so it's safe the update in-memory markers directly.
 		if head := self.hc.CurrentHeader(); head.Hash() == hash {
+			core.WriteHeadHeaderHash(batch, head.ParentHash)
 			self.hc.SetCurrentHeader(self.GetHeader(head.ParentHash, head.Number.Uint64()-1))
 		}
+
+	}
+
+	if err := batch.Write(); err != nil {
+		log.Crit("Failed to rollback light chain", "error", err)
 	}
 }
 
