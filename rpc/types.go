@@ -19,11 +19,12 @@ package rpc
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/tomochain/tomochain/common"
-	"math"
 	"reflect"
 	"strings"
 	"sync"
+
+	"github.com/tomochain/tomochain/common"
+	"github.com/tomochain/tomochain/common/math"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/tomochain/tomochain/common/hexutil"
@@ -148,9 +149,9 @@ func (bn *BlockNumber) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
-	blckNum, err := hexutil.DecodeUint64(input)
-	if err != nil {
-		return err
+	blckNum, ok := math.ParseUint64(input)
+	if !ok {
+		return fmt.Errorf("Blocknumber invalid")
 	}
 	if blckNum > math.MaxInt64 {
 		return fmt.Errorf("Blocknumber too high")
@@ -187,9 +188,9 @@ func (e *EpochNumber) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
-	eNum, err := hexutil.DecodeUint64(input)
-	if err != nil {
-		return err
+	eNum, ok := math.ParseUint64(input)
+	if !ok {
+		return fmt.Errorf("EpochNumber invalid")
 	}
 	if eNum > math.MaxInt64 {
 		return fmt.Errorf("EpochNumber too high")
@@ -258,12 +259,12 @@ func (bnh *BlockNumberOrHash) UnmarshalJSON(data []byte) error {
 			bnh.BlockHash = &hash
 			return nil
 		} else {
-			blckNum, err := hexutil.DecodeUint64(input)
-			if err != nil {
-				return err
+			blckNum, ok := math.ParseUint64(input)
+			if !ok {
+				return fmt.Errorf("Blocknumber invalid")
 			}
 			if blckNum > math.MaxInt64 {
-				return fmt.Errorf("blocknumber too high")
+				return fmt.Errorf("Blocknumber too high")
 			}
 			bn := BlockNumber(blckNum)
 			bnh.BlockNumber = &bn
