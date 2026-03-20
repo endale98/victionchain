@@ -65,8 +65,9 @@ type TraceConfig struct {
 
 // txTraceResult is the result of a single transaction trace.
 type txTraceResult struct {
-	Result interface{} `json:"result,omitempty"` // Trace results produced by the tracer
-	Error  string      `json:"error,omitempty"`  // Trace failure produced by the tracer
+	Result    interface{} `json:"result,omitempty"`    // Trace results produced by the tracer
+	Error     string      `json:"error,omitempty"`     // Trace failure produced by the tracer
+	PostState common.Hash `json:"postState,omitempty"` // State root after the transaction
 }
 
 // blockTraceTask represents a single block trace task when an entire chain is
@@ -458,6 +459,7 @@ func (api *PrivateDebugAPI) traceBlock(ctx context.Context, block *types.Block, 
 	// Feed the transactions into the tracers and return
 	feeCapacity := state.GetTRC21FeeCapacityFromState(statedb)
 	var failed error
+	roots := make([]common.Hash, len(txs))
 	for i, tx := range txs {
 		// Send the trace task over for execution
 		jobs <- &txTraceTask{statedb: statedb.Copy(), index: i}
@@ -478,8 +480,8 @@ func (api *PrivateDebugAPI) traceBlock(ctx context.Context, block *types.Block, 
 			break
 		}
 
-		// Finalize the state so any modifications are written to the trie
-		statedb.Finalise(true)
+		// Finalize the state and capture the intermediate root after this transaction
+		roots[i] = statedb.IntermediateRoot(true)
 	}
 	close(jobs)
 	pend.Wait()
@@ -487,6 +489,12 @@ func (api *PrivateDebugAPI) traceBlock(ctx context.Context, block *types.Block, 
 	// If execution failed in between, abort
 	if failed != nil {
 		return nil, failed
+	}
+	// Attach the intermediate state root to each result
+	for i, result := range results {
+		if result != nil {
+			result.PostState = roots[i]
+		}
 	}
 	return results, nil
 }
