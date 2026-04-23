@@ -687,6 +687,21 @@ func (s *PublicBlockChainAPI) GetBlockFinalityByHash(ctx context.Context, blockH
 	if err != nil || block == nil {
 		return uint(0), err
 	}
+
+	if block.NumberU64() == 0 {
+		return 100, nil
+	}
+
+	// Try strict 100% finality check first via closest finalized block.
+	// Pass queried block number so the scan stops early if it drops below.
+	closest := s.findClosestFinalizedBlock(ctx, block.NumberU64())
+	if closest != nil {
+		if block.NumberU64() <= closest.NumberU64() && s.b.AreTwoBlockSamePath(closest.Hash(), block.Hash()) {
+			return 100, nil
+		}
+	}
+
+	// Fallback to legacy percentage flow.
 	masternodes, err := s.GetMasternodes(ctx, block)
 	if err != nil || len(masternodes) == 0 {
 		log.Error("Failed to get masternodes", "err", err, "len(masternodes)", len(masternodes))
@@ -700,6 +715,21 @@ func (s *PublicBlockChainAPI) GetBlockFinalityByNumber(ctx context.Context, bloc
 	if err != nil || block == nil {
 		return uint(0), err
 	}
+
+	if block.NumberU64() == 0 {
+		return 100, nil
+	}
+
+	// Try strict 100% finality check first via closest finalized block.
+	// Pass queried block number so the scan stops early if it drops below.
+	closest := s.findClosestFinalizedBlock(ctx, block.NumberU64())
+	if closest != nil {
+		if block.NumberU64() <= closest.NumberU64() && s.b.AreTwoBlockSamePath(closest.Hash(), block.Hash()) {
+			return 100, nil
+		}
+	}
+
+	// Fallback to legacy percentage flow.
 	masternodes, err := s.GetMasternodes(ctx, block)
 	if err != nil || len(masternodes) == 0 {
 		log.Error("Failed to get masternodes", "err", err, "len(masternodes)", len(masternodes))
@@ -1318,6 +1348,59 @@ func (s *PublicBlockChainAPI) rpcOutputBlock(b *types.Block, inclTx bool, fullTx
 	}
 	fields["uncles"] = uncleHashes
 	return fields, nil
+}
+
+// findClosestFinalizedBlock scans backward from the current head to find the nearest
+// block with 100% finality (all masternodes have signed).
+// targetNumber is the queried block number: scanning stops early if it drops below this
+// value, since no result below the target can make the target finalized.
+// Pass 0 to scan without early stopping (used by FinalityBlockClosest).
+func (s *PublicBlockChainAPI) findClosestFinalizedBlock(ctx context.Context, targetNumber uint64) *types.Block {
+	head := s.b.CurrentBlock()
+	if head == nil {
+		return nil
+	}
+
+	headNumber := head.NumberU64()
+	scanStartBlockNumber, step := headNumber, uint64(1)
+	if chainConfig := s.b.ChainConfig(); chainConfig != nil && chainConfig.IsTIPSigning(new(big.Int).SetUint64(headNumber)) {
+		step = uint64(common.MergeSignRange)
+		scanStartBlockNumber = headNumber - (headNumber % step)
+	}
+
+	checkFinality := func(number uint64) (*types.Block, bool) {
+		if number < targetNumber {
+			return nil, false
+		}
+		candidate, err := s.b.BlockByNumber(ctx, rpc.BlockNumber(number))
+		if err != nil || candidate == nil {
+			return nil, false
+		}
+		masternodes, err := s.GetMasternodes(ctx, candidate)
+		if err != nil || len(masternodes) == 0 {
+			return nil, false
+		}
+		finality, err := s.findFinalityOfBlock(ctx, candidate, masternodes)
+		if err == nil && finality == 100 {
+			return candidate, true
+		}
+		return nil, false
+	}
+
+	for number := scanStartBlockNumber; number > 0; {
+		if number < targetNumber {
+			return nil
+		}
+
+		if candidate, ok := checkFinality(number); ok {
+			return candidate
+		}
+		if number <= step {
+			break
+		}
+		number -= step
+	}
+	return nil
 }
 
 // findNearestSignedBlock finds the nearest checkpoint from input block
