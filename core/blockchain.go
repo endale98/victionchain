@@ -875,15 +875,23 @@ func (bc *BlockChain) GetBlocksHashCache(number uint64) []common.Hash {
 // AreTwoBlockSamePath check if two blocks are same path
 // Assume block 1 is ahead block 2 so we need to check parentHash
 func (bc *BlockChain) AreTwoBlockSamePath(bh1 common.Hash, bh2 common.Hash) bool {
-	bl1 := bc.GetBlockByHash(bh1)
-	bl2 := bc.GetBlockByHash(bh2)
-	toBlockLevel := bl2.Number().Uint64()
+	h1 := bc.GetHeaderByHash(bh1)
+	h2 := bc.GetHeaderByHash(bh2)
+	if h1 == nil || h2 == nil {
+		return false
+	}
+	toLevel := h2.Number.Uint64()
+	hash1 := bh1
 
-	for bl1.Number().Uint64() > toBlockLevel {
-		bl1 = bc.GetBlockByHash(bl1.ParentHash())
+	for h1.Number.Uint64() > toLevel {
+		hash1 = h1.ParentHash
+		h1 = bc.GetHeaderByHash(hash1)
+		if h1 == nil {
+			return false
+		}
 	}
 
-	return (bl1.Hash() == bl2.Hash())
+	return hash1 == bh2
 }
 
 // GetUnclesInChain retrieves all the uncles from a given block backwards until
