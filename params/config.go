@@ -33,15 +33,16 @@ var (
 var (
 	// VicMainnetChainConfig contains the chain parameters to run a Viction node on the main network.
 	VicMainnetChainConfig = &ChainConfig{
-		ChainId:        big.NewInt(88),
-		HomesteadBlock: big.NewInt(1),
-		EIP150Block:    big.NewInt(2),
-		EIP150Hash:     common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000000"),
-		EIP155Block:    big.NewInt(3),
-		EIP158Block:    big.NewInt(3),
-		ByzantiumBlock: big.NewInt(4),
-		SaigonBlock:    big.NewInt(86158494),
-		AtlasBlock:     big.NewInt(97705094),
+		ChainId:            big.NewInt(88),
+		HomesteadBlock:     big.NewInt(1),
+		EIP150Block:        big.NewInt(2),
+		EIP150Hash:         common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000000"),
+		EIP155Block:        big.NewInt(3),
+		EIP158Block:        big.NewInt(3),
+		ByzantiumBlock:     big.NewInt(4),
+		SaigonBlock:        big.NewInt(86158494),
+		AtlasBlock:         big.NewInt(97705094),
+		PrePrometheusBlock: big.NewInt(110712671),
 		Posv: &PosvConfig{
 			Period:              2,
 			Epoch:               900,
@@ -71,6 +72,7 @@ var (
 		TIPTomoXCancellationFeeBlock: big.NewInt(0),
 		SaigonBlock:                  big.NewInt(10004200),
 		AtlasBlock:                   big.NewInt(24697500),
+		PrePrometheusBlock:           big.NewInt(36911450),
 		Posv: &PosvConfig{
 			Period:              2,
 			Epoch:               900,
@@ -218,9 +220,9 @@ type ChainConfig struct {
 	TIPTomoXLendingBlock         *big.Int `json:"tipTomoXLendingBlock,omitempty"`         // TIPTomoXLending switch block (nil = no fork, 0 = already activated)
 	TIPTomoXCancellationFeeBlock *big.Int `json:"tipTomoXCancellationFeeBlock,omitempty"` // TIPTomoXCancellationFee switch block (nil = no fork, 0 = already activated)
 
-	SaigonBlock       *big.Int `json:"saigonBlock,omitempty"`       // Saigon switch block (nil = no fork, 0 = already activated)
-	AtlasBlock        *big.Int `json:"atlasBlock,omitempty"`        // Atlas switch block (nil = no fork, 0 = already activated)
-	ExperientialBlock *big.Int `json:"experientialBlock,omitempty"` // Experiential switch block (nil = no fork, 0 = already activated)
+	SaigonBlock        *big.Int `json:"saigonBlock,omitempty"`        // Saigon switch block (nil = no fork, 0 = already activated)
+	AtlasBlock         *big.Int `json:"atlasBlock,omitempty"`         // Atlas switch block (nil = no fork, 0 = already activated)
+	PrePrometheusBlock *big.Int `json:"prePrometheusBlock,omitempty"` // PrePrometheus switch block (nil = no fork, 0 = already activated)
 
 	// Various consensus engines
 	Ethash *EthashConfig `json:"ethash,omitempty"`
@@ -273,7 +275,7 @@ func (c *ChainConfig) String() string {
 	default:
 		engine = "unknown"
 	}
-	return fmt.Sprintf("{ChainID: %v Homestead: %v EIP150: %v EIP155: %v EIP158: %v Byzantium: %v TIP2019: %v TIPSigning: %v TIPRandomize: %v BlackListHF: %v TIPTRC21Fee: %v TIPTomoX: %v TIPTomoXLending: %v TIPTomoXCancellationFee: %v Saigon: %v Atlas: %v Engine: %v}",
+	return fmt.Sprintf("{ChainID: %v Homestead: %v EIP150: %v EIP155: %v EIP158: %v Byzantium: %v TIP2019: %v TIPSigning: %v TIPRandomize: %v BlackListHF: %v TIPTRC21Fee: %v TIPTomoX: %v TIPTomoXLending: %v TIPTomoXCancellationFee: %v Saigon: %v Atlas: %v PrePrometheus: %v Engine: %v}",
 		c.ChainId,
 		c.HomesteadBlock,
 		c.EIP150Block,
@@ -290,6 +292,7 @@ func (c *ChainConfig) String() string {
 		c.TIPTomoXCancellationFeeBlock,
 		c.SaigonBlock,
 		c.AtlasBlock,
+		c.PrePrometheusBlock,
 		engine,
 	)
 }
@@ -371,8 +374,8 @@ func (c *ChainConfig) IsAtlas(num *big.Int) bool {
 	return isForked(c.AtlasBlock, num)
 }
 
-func (c *ChainConfig) IsExperiential(num *big.Int) bool {
-	return isForked(c.ExperientialBlock, num)
+func (c *ChainConfig) IsPrePrometheus(num *big.Int) bool {
+	return isForked(c.PrePrometheusBlock, num)
 }
 
 /* Feature flag check */
@@ -485,6 +488,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, head *big.Int) *Confi
 	if isForkIncompatible(c.AtlasBlock, newcfg.AtlasBlock, head) {
 		return newCompatError("Atlas fork block", c.AtlasBlock, newcfg.AtlasBlock)
 	}
+	if isForkIncompatible(c.PrePrometheusBlock, newcfg.PrePrometheusBlock, head) {
+		return newCompatError("PrePrometheus fork block", c.PrePrometheusBlock, newcfg.PrePrometheusBlock)
+	}
 	return nil
 }
 
@@ -555,7 +561,7 @@ type Rules struct {
 	IsTIP2019, IsTIPSigning, IsTIPRandomize                  bool
 	IsBlackListHF, IsTIPTRC21Fee                             bool
 	IsTIPTomoX, IsTIPTomoXLending, IsTIPTomoXCancellationFee bool
-	IsSaigon, IsAtlas                                        bool
+	IsSaigon, IsAtlas, IsPrePrometheus                       bool
 }
 
 func (c *ChainConfig) Rules(num *big.Int) Rules {
@@ -584,5 +590,6 @@ func (c *ChainConfig) Rules(num *big.Int) Rules {
 		IsTIPTomoXCancellationFee: c.IsTIPTomoXCancellationFee(num),
 		IsSaigon:                  c.IsSaigon(num),
 		IsAtlas:                   c.IsAtlas(num),
+		IsPrePrometheus:           c.IsPrePrometheus(num),
 	}
 }
